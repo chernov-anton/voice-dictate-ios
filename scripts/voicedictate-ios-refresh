@@ -1,0 +1,290 @@
+#!/bin/bash
+# Keeps the Personal Team-signed iOS app on an iPhone from expiring: when the
+# installed build's 7-day profile is within REFRESH_WITHIN_HOURS of expiry,
+# builds the committed code of REF with a fresh profile and installs it over
+# the top (never uninstalls: that would wipe the imported configuration).
+#
+# Run Mon-Fri at 10:00, 10:30, 11:00 and 11:30 by the LaunchAgent that
+# install-refresh-agent.sh installs: hours when you are likely at the Mac and
+# not dictating on the phone. Its own file with a shebang so System Settings >
+# Login Items lists the agent by this name instead of as "bash".
+#
+# Usage: VD_REFRESH_DEVICE=<id> voicedictate-ios-refresh [--dry-run] [--force] [--no-install]
+#        VD_REFRESH_DEVICE=<id> voicedictate-ios-refresh --record <path/to/VoiceDictate.app>
+#   <id>          the iPhone, as in the Identifier column of
+#                 `xcrun devicectl list devices` (the agent sets it)
+#   --dry-run     decide and print what would happen; no build, no install
+#   --force       ignore the expiry and install-window checks
+#   --no-install  build (and check the new profile) but don't touch the phone
+#   --record APP  store APP's profile expiry as the installed one (after a
+#                 manual install from Xcode or the README recipe)
+#
+# devicectl can't report the profile on the phone, so the expiry of the last
+# installed build is tracked in STATE_FILE.
+set -uo pipefail
+
+# ---- settings ---------------------------------------------------------------
+DEVICE_ID="${VD_REFRESH_DEVICE:-}"
+REF="${VD_REFRESH_REF:-}"     # git ref to build; empty = the branch the repo is on
+# Installing restarts the keyboard (killing a dictation in progress), so only
+# Mon-Fri 10:00-11:59 local time, and never outside it.
+WINDOW_FIRST_WEEKDAY=1        # Monday
+WINDOW_LAST_WEEKDAY=5         # Friday
+WINDOW_START_HOUR=10
+WINDOW_END_HOUR=12
+# Due when under 100 h remain. Any 98 h span (4 days + the 2 h window) holds
+# the full 10:00-12:00 windows of four consecutive days, and any four
+# consecutive days include at least two weekdays (worst cases Thu-Sun and
+# Sat-Tue). So whatever the expiry time -- 7 days after a refresh on any
+# weekday, or after a manual install at any hour -- at least two full weekday
+# windows lie between "due" and expiry: Mon -> Thu+Fri, Tue -> Fri+Mon,
+# Wed -> Mon+Tue, Thu -> Mon-Wed, Fri -> Mon-Thu. The 2 h over 98 cover a
+# 25 h DST day and launchd's start delay. 96 h is not enough: a profile made
+# Mon 11:35 comes due Thu 11:35, after Thursday's last run, leaving Friday.
+# A new build lasts at least MIN_FRESH_HOURS (> 100), so once a refresh
+# succeeds the day's later runs skip.
+REFRESH_WITHIN_HOURS=100
+MIN_FRESH_HOURS=144           # a new build's profile must last at least 6 days
+LOG_MAX_BYTES=524288          # then the log rotates to .1
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${VD_REFRESH_REPO:-$(cd "$HERE/.." && pwd)}"
+STATE_FILE="$HOME/Library/Application Support/voice-dictate/ios-refresh.json"
+LOG_FILE="$HOME/Library/Logs/voice-dictate-ios-refresh.log"
+WORK_DIR="$HOME/Library/Caches/voice-dictate/ios-refresh"
+PROFILES_DIR="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+
+# launchd gives a minimal PATH and no DEVELOPER_DIR. Appended, so a caller's
+# PATH (the tests' stubs) still wins.
+export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# shellcheck source=refresh-lib.sh
+. "$HERE/refresh-lib.sh"
+
+# Under test every external tool must resolve to a stub: never the real phone
+# or Apple's servers.
+if [ -n "${VD_REFRESH_TEST_STUBS:-}" ]; then
+  for tool in xcrun xcodebuild xcodegen git security osascript; do
+    if [ "$(command -v "$tool")" != "$VD_REFRESH_TEST_STUBS/$tool" ]; then
+      echo "refusing to run under test: $tool is not stubbed" >&2
+      exit 99
+    fi
+  done
+fi
+
+ORIG_ARGS=("$@")
+DRY_RUN=0 FORCE=0 INSTALL=1 RECORD_APP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --force) FORCE=1 ;;
+    --no-install) INSTALL=0 ;;
+    --record) RECORD_APP="${2:-}"; [ -n "$RECORD_APP" ] || { echo "--record needs an app path" >&2; exit 64; }; shift ;;
+    -h|--help) sed -n '2,/^set -uo/{/^#/s/^# \{0,1\}//p;}' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1 (see --help)" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+if [ -n "$RECORD_APP" ] && [ "$DRY_RUN$FORCE$INSTALL" != 001 ]; then
+  echo "--record takes no other flags" >&2; exit 64
+fi
+[ -n "$DEVICE_ID" ] || { echo "set VD_REFRESH_DEVICE to the iPhone's devicectl identifier (see --help)" >&2; exit 64; }
+
+mkdir -p "$WORK_DIR" "$(dirname "$LOG_FILE")"
+
+# One real run at a time (a manual run while launchd's is building).
+if [ "$DRY_RUN" = 0 ] && [ -z "${VD_REFRESH_LOCKED:-}" ]; then
+  VD_REFRESH_LOCKED=1 exec /usr/bin/lockf -t 0 "$WORK_DIR/lock" "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+fi
+
+if [ -f "$LOG_FILE" ] && [ "$(stat -f %z "$LOG_FILE")" -gt "$LOG_MAX_BYTES" ]; then
+  mv -f "$LOG_FILE" "$LOG_FILE.1"
+fi
+
+# Dry runs only print. Under launchd stdout already is the log file.
+log() {
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+  if [ "$DRY_RUN" = 1 ]; then printf '%s\n' "$line"; return; fi
+  printf '%s\n' "$line" >>"$LOG_FILE"
+  [ -n "${VD_REFRESH_LAUNCHD:-}" ] || printf '%s\n' "$line"
+}
+
+notify() {
+  osascript -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "Voice Dictate" subtitle "iPhone app refresh"' \
+    -e 'end run' "$1" >/dev/null 2>&1 || true
+}
+
+# The one notification of a run: the re-sign didn't happen, when it must.
+fail() { # <short reason> -> notification + log, exit 1
+  log "FAIL: $1"
+  if [ -n "${EXPIRY:-}" ]; then
+    notify "iPhone keyboard re-sign pending: $1. Profile expires $(local_time "$EXPIRY")."
+  else
+    notify "iPhone keyboard re-sign pending: $1. Profile expiry unknown."
+  fi
+  exit 1
+}
+
+now() { echo "${VD_REFRESH_NOW:-$(date +%s)}"; }
+
+NOW=$(now)
+
+# ---- --record ---------------------------------------------------------------
+if [ -n "$RECORD_APP" ]; then
+  [ -d "$RECORD_APP" ] || { log "FAIL: no app at $RECORD_APP"; exit 1; }
+  RECORD_APP="$(cd "$RECORD_APP" && pwd)"
+  exp=$(app_expiry "$RECORD_APP") || { log "FAIL: no readable profile in $RECORD_APP"; exit 1; }
+  bid=$(plutil -extract CFBundleIdentifier raw -o - "$RECORD_APP/Info.plist") || exit 1
+  state_write "$STATE_FILE" expiry "$exp" bundle_id "$bid" commit "unknown" \
+    installed_at "$(epoch_to_iso "$NOW")" device "$DEVICE_ID" source "recorded $RECORD_APP" || exit 1
+  log "recorded $bid: profile valid until $exp"
+  exit 0
+fi
+
+# ---- decide -----------------------------------------------------------------
+# The state describes one device; for any other its expiry is unknown.
+EXPIRY_ISO="" EXPIRY="" STATUS="no recorded expiry in $STATE_FILE"
+STATE_DEVICE=$(state_get "$STATE_FILE" device || true)
+if [ -n "$STATE_DEVICE" ] && [ "$STATE_DEVICE" != "$DEVICE_ID" ]; then
+  STATUS="recorded expiry is for $STATE_DEVICE, not $DEVICE_ID"
+else
+  EXPIRY_ISO=$(state_get "$STATE_FILE" expiry || true)
+  [ -n "$EXPIRY_ISO" ] && EXPIRY=$(iso_to_epoch "$EXPIRY_ISO" || true)
+  [ -n "$EXPIRY" ] && STATUS="profile expires $EXPIRY_ISO (in $(format_left $((EXPIRY - NOW))))"
+fi
+DECISION=$(decide "$NOW" "$EXPIRY")
+
+if [ "$FORCE" = 1 ]; then
+  log "$STATUS; decision $DECISION, overridden by --force"
+else
+  case "$DECISION" in
+    skip) log "skip: $STATUS, refresh starts ${REFRESH_WITHIN_HOURS}h before"; exit 0 ;;
+    wait) log "skip: $STATUS, due but outside the install window $(window_text)"; exit 0 ;;
+    *) log "$STATUS; decision $DECISION" ;;
+  esac
+fi
+
+if [ -z "$REF" ]; then
+  REF=$(git -C "$REPO" symbolic-ref -q --short HEAD) || REF=HEAD
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+  log "dry-run: would build committed $REF and $([ "$INSTALL" = 1 ] && echo "install on $DEVICE_ID" || echo "not install (--no-install)")"
+  exit 0
+fi
+
+# ---- phone reachable? -------------------------------------------------------
+if [ "$INSTALL" = 1 ]; then
+  if ! xcrun devicectl list devices --json-output "$WORK_DIR/devices.json" >/dev/null 2>&1 ||
+     ! device_reachable "$WORK_DIR/devices.json" "$DEVICE_ID"; then
+    # Due and in the window: you are likely at the Mac and can plug in or
+    # unlock the phone before the next run. A forced run outside it just logs.
+    if [ "$DECISION" = refresh ]; then
+      fail "iPhone not reachable, connect or unlock it"
+    fi
+    log "iPhone $DEVICE_ID not reachable; not building"
+    exit 1
+  fi
+fi
+
+# ---- build committed code ---------------------------------------------------
+COMMIT=$(git -C "$REPO" rev-parse -q --verify "$REF^{commit}") || fail "unknown git ref $REF"
+[ -f "$REPO/Local.xcconfig" ] || fail "missing Local.xcconfig (team ID and ID prefix)"
+
+SRC="$WORK_DIR/src"
+DERIVED="$WORK_DIR/DerivedData"
+BUILD_LOG="$WORK_DIR/build.log"
+APP="$DERIVED/Build/Products/Debug-iphoneos/VoiceDictate.app"
+trap 'rm -rf "$SRC"' EXIT
+
+rm -rf "$SRC" && mkdir -p "$SRC" || fail "cannot create $SRC"
+git -C "$REPO" archive --format=tar "$COMMIT" | tar -x -C "$SRC" || fail "git archive of $REF failed"
+cp "$REPO/Local.xcconfig" "$SRC/Local.xcconfig" || fail "cannot copy Local.xcconfig"
+log "building ${COMMIT:0:12} ($REF); xcodebuild output in $BUILD_LOG"
+
+build() {
+  rm -rf "$APP"
+  {
+    xcodegen generate --spec "$SRC/project.yml" &&
+    xcodebuild -project "$SRC/VoiceDictate.xcodeproj" -scheme VoiceDictate \
+      -configuration Debug -xcconfig "$SRC/Local.xcconfig" \
+      -destination 'generic/platform=iOS' -derivedDataPath "$DERIVED" \
+      -allowProvisioningUpdates build
+  } >"$BUILD_LOG" 2>&1 && [ -d "$APP" ]
+}
+
+build_failed() {
+  local first
+  first=$(grep -m1 -E '(error|fatal):' "$BUILD_LOG" | sed -e 's/^.*error: //' -e 's/^.*fatal: //' | cut -c1-160)
+  grep -E '(error|fatal):' "$BUILD_LOG" | tail -n 5 | sed 's/^/  | /' >>"$LOG_FILE"
+  fail "build failed: ${first:-see $BUILD_LOG}"
+}
+
+# Xcode keeps using a cached profile while it is still valid, so a refresh a
+# few days before expiry can come back with the same old date. Then move the
+# cached profiles for these app IDs aside and build once more, which makes
+# Xcode fetch a new one.
+purge_stale_profiles() {
+  local ids f id exp ep moved=0 dest="$WORK_DIR/stale-profiles"
+  ids=$(app_identifiers "$APP")
+  [ -n "$ids" ] && [ -d "$PROFILES_DIR" ] || return 1
+  mkdir -p "$dest"
+  for f in "$PROFILES_DIR"/*.mobileprovision; do
+    [ -f "$f" ] || continue
+    id=$(profile_app_identifier "$f") || continue
+    printf '%s\n' "$ids" | grep -qxF "$id" || continue
+    exp=$(profile_expiry "$f") && ep=$(iso_to_epoch "$exp") || continue
+    [ $((ep - NOW)) -lt $((MIN_FRESH_HOURS * 3600)) ] || continue
+    mv -f "$f" "$dest/" && moved=$((moved + 1)) && log "moved cached profile $(basename "$f") ($id, expires $exp) to $dest"
+  done
+  [ "$moved" -gt 0 ]
+}
+
+is_fresh() { # <expiry ISO>
+  local ep
+  ep=$(iso_to_epoch "$1") && [ $((ep - NOW)) -ge $((MIN_FRESH_HOURS * 3600)) ]
+}
+
+build || build_failed
+NEW_EXPIRY=$(app_expiry "$APP") || fail "built app has no readable provisioning profile"
+if ! is_fresh "$NEW_EXPIRY"; then
+  log "built profile expires $NEW_EXPIRY, less than ${MIN_FRESH_HOURS}h away"
+  purge_stale_profiles || fail "Xcode reused a profile expiring $NEW_EXPIRY and none could be purged"
+  build || build_failed
+  NEW_EXPIRY=$(app_expiry "$APP") || fail "built app has no readable provisioning profile"
+  is_fresh "$NEW_EXPIRY" || fail "Xcode still signs with a profile expiring $NEW_EXPIRY"
+fi
+BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw -o - "$APP/Info.plist") || fail "built app has no bundle ID"
+log "built $BUNDLE_ID ${COMMIT:0:12}: profile valid until $NEW_EXPIRY"
+
+if [ "$INSTALL" = 0 ]; then
+  log "not installing (--no-install): $APP"
+  exit 0
+fi
+
+# The build can take minutes; don't start an install past the window.
+NOW=$(now)
+if [ "$FORCE" = 0 ] && [ "$(decide "$NOW" "$EXPIRY")" = wait ]; then
+  log "install window ended during the build; installing next run"
+  exit 0
+fi
+
+# ---- install over the top ---------------------------------------------------
+if ! xcrun devicectl device install app --device "$DEVICE_ID" "$APP" \
+     --json-output "$WORK_DIR/install.json" >>"$BUILD_LOG" 2>&1; then
+  tail -n 5 "$BUILD_LOG" | sed 's/^/  | /' >>"$LOG_FILE"
+  fail "install on the iPhone failed (see $LOG_FILE)"
+fi
+if ! xcrun devicectl device info apps --device "$DEVICE_ID" --bundle-id "$BUNDLE_ID" \
+       --json-output "$WORK_DIR/apps.json" >/dev/null 2>&1 ||
+   ! app_installed "$WORK_DIR/apps.json" "$BUNDLE_ID"; then
+  fail "installed, but $BUNDLE_ID is not listed on the iPhone"
+fi
+state_write "$STATE_FILE" expiry "$NEW_EXPIRY" bundle_id "$BUNDLE_ID" commit "$COMMIT" \
+  installed_at "$(epoch_to_iso "$NOW")" device "$DEVICE_ID" source "voicedictate-ios-refresh" ||
+  fail "installed, but could not write $STATE_FILE"
+log "installed ${COMMIT:0:12} on $DEVICE_ID: valid until $NEW_EXPIRY"

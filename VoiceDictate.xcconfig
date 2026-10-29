@@ -1,0 +1,11 @@
+// Build-setting defaults for both targets. Don't edit: copy Local.xcconfig.example
+// to Local.xcconfig and set your values there; it is included last, so it wins.
+//
+// Bundle IDs and App Group derived from these:
+//   app       $(VOICEDICTATE_ID_PREFIX).voicedictate.ios$(VOICEDICTATE_ID_SUFFIX)
+//   keyboard  $(VOICEDICTATE_ID_PREFIX).voicedictate.ios$(VOICEDICTATE_ID_SUFFIX).keyboard
+//   App Group group.$(VOICEDICTATE_ID_PREFIX).voicedictate.ios$(VOICEDICTATE_ID_SUFFIX)
+VOICEDICTATE_ID_PREFIX = com.example
+VOICEDICTATE_ID_SUFFIX =
+
+#include? "Local.xcconfig"

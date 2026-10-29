@@ -1,0 +1,14 @@
+// Copy to Local.xcconfig (git-ignored). VoiceDictate.xcconfig includes it, so
+// Xcode and xcodebuild both pick it up after `xcodegen generate`.
+
+// Your Apple team ID: Xcode > Settings > Accounts > your team, or the
+// "OU" of your Apple Development certificate. A free Personal Team works.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID
+
+// Reverse-DNS prefix you own, e.g. com.yourname. Bundle IDs and the App Group
+// are registered to your team, so they must not collide with anyone else's.
+VOICEDICTATE_ID_PREFIX = com.yourname
+
+// Optional: appended to both bundle IDs and the App Group, the way SideStore
+// re-signs (".<TEAMID>"). Leave empty when building with Xcode.
+// VOICEDICTATE_ID_SUFFIX = .YOUR_TEAM_ID

@@ -1,0 +1,95 @@
+name: VoiceDictate
+configFiles:
+  Debug: VoiceDictate.xcconfig
+  Release: VoiceDictate.xcconfig
+options:
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: "0.1"
+    TARGETED_DEVICE_FAMILY: "1"
+    # VOICEDICTATE_ID_PREFIX / _SUFFIX come from VoiceDictate.xcconfig and Local.xcconfig;
+    # don't set them here, project settings would override Local.xcconfig.
+packages:
+  DictationAudio:
+    path: Audio
+  DictationCore:
+    path: Core
+  DictationShared:
+    path: Shared
+targets:
+  VoiceDictate:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(VOICEDICTATE_ID_PREFIX).voicedictate.ios$(VOICEDICTATE_ID_SUFFIX)
+        GENERATE_INFOPLIST_FILE: YES
+        # App/Assets.xcassets, picked up by `sources: [App]`.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleDisplayName: Voice Dictate
+        # Read by DictationShared.Identifiers to derive the App Group and Keychain service.
+        VoiceDictateIDPrefix: $(VOICEDICTATE_ID_PREFIX)
+        CFBundleURLTypes:
+          - CFBundleURLName: $(PRODUCT_BUNDLE_IDENTIFIER)
+            CFBundleURLSchemes: [voicedictate]
+        NSMicrophoneUsageDescription: Record speech for your dictation keyboard. Recordings are sent to OpenAI and transcripts to Anthropic for cleanup.
+        UIBackgroundModes: [audio]
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    entitlements:
+      path: App/App.entitlements
+      properties:
+        com.apple.security.application-groups: ["group.$(VOICEDICTATE_ID_PREFIX).voicedictate.ios$(VOICEDICTATE_ID_SUFFIX)"]
+    dependencies:
+      - package: DictationAudio
+      - package: DictationCore
+      - package: DictationShared
+      - target: DictationKeyboard
+        embed: true
+  DictationKeyboard:
+    type: app-extension
+    platform: iOS
+    sources: [Keyboard]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(VOICEDICTATE_ID_PREFIX).voicedictate.ios$(VOICEDICTATE_ID_SUFFIX).keyboard
+        APPLICATION_EXTENSION_API_ONLY: YES
+        GENERATE_INFOPLIST_FILE: YES
+    info:
+      path: Keyboard/Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleDisplayName: Voice Dictate
+        VoiceDictateIDPrefix: $(VOICEDICTATE_ID_PREFIX)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.keyboard-service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardViewController
+          NSExtensionAttributes:
+            IsASCIICapable: false
+            PrefersRightToLeft: false
+            PrimaryLanguage: en-US
+            RequestsOpenAccess: true
+    entitlements:
+      path: Keyboard/Keyboard.entitlements
+      properties:
+        com.apple.security.application-groups: ["group.$(VOICEDICTATE_ID_PREFIX).voicedictate.ios$(VOICEDICTATE_ID_SUFFIX)"]
+    dependencies:
+      - package: DictationShared
+schemes:
+  VoiceDictate:
+    build:
+      targets:
+        VoiceDictate: all
