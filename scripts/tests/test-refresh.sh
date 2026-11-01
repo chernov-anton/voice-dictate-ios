@@ -76,6 +76,43 @@ SETTINGS="$(grep -E '^(REFRESH_WITHIN_HOURS|MIN_FRESH_HOURS|WINDOW_[A-Z_]+)=' "$
   eq "format_left"                               "2d 3h" "$(format_left $((51 * H + 59)))"
   eq "format_left: expired"                      "-0d 5h" "$(format_left $((-5 * H)))"
   eq "iso_to_epoch rejects junk"                 1 "$(iso_to_epoch nonsense >/dev/null; echo $?)"
+  # device_reachable: `list devices` files and `device info details` files.
+  J="$TMP/unit-json"; mkdir -p "$J"
+  dev() { # <id> <pairing> <tunnel> <caps json>
+    printf '{"identifier":"%s","hardwareProperties":{"udid":"UDID-%s"},"capabilities":%s,"connectionProperties":{"pairingState":"%s","tunnelState":"%s"}}' "$1" "$1" "$4" "$2" "$3"
+  }
+  INSTALLAPP='[{"featureIdentifier":"com.apple.coredevice.feature.installapp"}]'
+  CONNECTONLY='[{"featureIdentifier":"com.apple.coredevice.feature.connectdevice"}]'
+  r() { device_reachable "$J/$1" "${2:-D1}" && echo yes || echo no; }
+  printf '{"result":{"devices":[%s,%s]}}' "$(dev D0 paired connected "$INSTALLAPP")" "$(dev D1 paired connected "[]")" >"$J/list-connected"
+  printf '{"result":{"devices":[%s]}}' "$(dev D1 paired disconnected "$INSTALLAPP")" >"$J/list-available"
+  printf '{"result":{"devices":[%s]}}' "$(dev D1 paired disconnected "$CONNECTONLY")" >"$J/list-idle"
+  printf '{"result":{"devices":[%s]}}' "$(dev D1 unpaired connected "$INSTALLAPP")" >"$J/list-unpaired"
+  printf '{"result":%s}' "$(dev D1 paired connected "$INSTALLAPP")" >"$J/details-connected"
+  printf '{"result":%s}' "$(dev D1 paired disconnected "$CONNECTONLY")" >"$J/details-best-effort"
+  printf '{"info":{"outcome":"failed"},"error":{"code":1,"userInfo":{}}}' >"$J/details-error"
+  printf 'not json' >"$J/junk"
+  eq "reachable: list, tunnel connected"         yes "$(r list-connected)"
+  eq "reachable: list, by UDID"                  yes "$(r list-connected UDID-D1)"
+  eq "reachable: list, other device only"        no  "$(r list-connected D9)"
+  eq "reachable: list, installapp capability"    yes "$(r list-available)"
+  eq "reachable: list, paired but idle (Fri 30 Oct)" no "$(r list-idle)"
+  eq "reachable: list, unpaired"                 no  "$(r list-unpaired)"
+  eq "reachable: details, connected"             yes "$(r details-connected)"
+  eq "reachable: details, other device"          no  "$(r details-connected D9)"
+  eq "reachable: details, best-effort stale info" no "$(r details-best-effort)"
+  eq "reachable: details, error result"          no  "$(r details-error)"
+  eq "reachable: junk"                           no  "$(r junk)"
+  eq "reachable: missing file"                   no  "$(r missing)"
+  l() { says_locked "$@" && echo yes || echo no; }
+  echo 'ERROR: The developer disk image could not be mounted on this device. (kAMDMobileImageMounterDeviceLocked: The device is locked.)' >"$J/ddi-locked"
+  echo 'ERROR: Unable to connect: The device is passcode protected.' >"$J/passcode"
+  echo 'ERROR: Timed out waiting for the device to connect.' >"$J/timeout"
+  eq "locked: DDI mount error"                   yes "$(l "$J/ddi-locked")"
+  eq "locked: passcode protected"                yes "$(l "$J/passcode")"
+  eq "locked: in the second file"                yes "$(l "$J/timeout" "$J/ddi-locked")"
+  eq "locked: timeout is not a lock"             no  "$(l "$J/timeout")"
+  eq "locked: missing files"                     no  "$(l "$J/missing" "$J/missing2")"
 ) | tee "$TMP/unit.out"
 PASS=$((PASS + $(grep -c '^ok' "$TMP/unit.out"))); FAIL=$((FAIL + $(grep -c '^FAIL' "$TMP/unit.out")))
 
@@ -148,23 +185,49 @@ prof() { printf "<plist version=\"1.0\"><dict><key>ExpirationDate</key><date>%s<
 prof "${line%;*}" TEAM.test.app >"$app/embedded.mobileprovision"
 prof "${line#*;}" TEAM.test.app.keyboard >"$app/PlugIns/DictationKeyboard.appex/embedded.mobileprovision"
 printf "<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>test.app</string></dict></plist>\n" >"$app/Info.plist"'
-# xcrun devicectl: device list by $STUB_DEVICE (connected|available|gone),
-# install fails with $STUB_INSTALL_FAIL, apps lists test.app once installed.
+# xcrun devicectl: the device by $STUB_DEVICE:
+#   connected  list shows a live tunnel
+#   available  list shows the installapp capability, no tunnel
+#   idle       list shows paired/disconnected (what `list devices` reports
+#              until something connects); `device info details` connects
+#   stale      idle, and details answers with the same stale state
+#   locked     idle, and details fails because the phone is locked
+#   gone       unavailable, and details times out
+# install fails with $STUB_INSTALL_FAIL, apps lists test.app once installed,
+# or fails as on a locked phone with $STUB_APPS_LOCKED.
 stub xcrun 'echo "xcrun $*" >>"$CALLS"
 [ "$1" = devicectl ] || exit 1; shift
 out=""; args="$*"; while [ $# -gt 0 ]; do [ "$1" = --json-output ] && out=$2; shift; done
+installapp="[{\"featureIdentifier\":\"com.apple.coredevice.feature.installapp\"}]"
+connectonly="[{\"featureIdentifier\":\"com.apple.coredevice.feature.connectdevice\"}]"
+dev() { printf "{\"identifier\":\"TEST-DEVICE\",\"capabilities\":%s,\"connectionProperties\":{\"pairingState\":\"paired\",\"tunnelState\":\"%s\"}}" "$2" "$1"; }
+state=${STUB_DEVICE:-connected}
 case "$args" in
   "list devices"*)
-    case "${STUB_DEVICE:-connected}" in
-      connected) tunnel=connected caps="[{\"featureIdentifier\":\"com.apple.coredevice.feature.installapp\"}]" ;;
-      available) tunnel=disconnected caps="[{\"featureIdentifier\":\"com.apple.coredevice.feature.installapp\"}]" ;;
-      *) tunnel=unavailable caps="[]" ;;
+    case "$state" in
+      connected) d=$(dev connected "$installapp") ;;
+      available) d=$(dev disconnected "$installapp") ;;
+      idle|stale|locked) d=$(dev disconnected "$connectonly") ;;
+      *) d=$(dev unavailable "[]") ;;
     esac
-    printf "{\"result\":{\"devices\":[{\"identifier\":\"TEST-DEVICE\",\"capabilities\":%s,\"connectionProperties\":{\"pairingState\":\"paired\",\"tunnelState\":\"%s\"}}]}}" "$caps" "$tunnel" >"$out" ;;
+    printf "{\"result\":{\"devices\":[%s]}}" "$d" >"$out" ;;
+  "device info details"*)
+    case "$state" in
+      idle) printf "{\"result\":%s}" "$(dev connected "$installapp")" >"$out" ;;
+      stale) printf "{\"result\":%s}" "$(dev disconnected "$connectonly")" >"$out" ;;
+      locked)
+        echo "ERROR: The developer disk image could not be mounted on this device. (kAMDMobileImageMounterDeviceLocked: The device is locked.)"
+        printf "{\"info\":{\"outcome\":\"failed\"},\"error\":{\"code\":1}}" >"$out"; exit 1 ;;
+      *)
+        echo "ERROR: Timed out waiting for the device to connect."
+        printf "{\"info\":{\"outcome\":\"failed\"},\"error\":{\"code\":2}}" >"$out"; exit 1 ;;
+    esac ;;
   "device install app"*)
     [ -z "${STUB_INSTALL_FAIL:-}" ] || { echo "ERROR: install failed"; exit 1; }
     touch "$STUB_INSTALLED"; echo "{}" >"$out" ;;
   "device info apps"*)
+    if [ -n "${STUB_APPS_LOCKED:-}" ]; then
+      echo "ERROR: The developer disk image could not be mounted on this device. (kAMDMobileImageMounterDeviceLocked: The device is locked.)"; exit 1; fi
     if [ -f "$STUB_INSTALLED" ]; then apps="[{\"bundleIdentifier\":\"test.app\"}]"; else apps="[]"; fi
     printf "{\"result\":{\"apps\":%s}}" "$apps" >"$out" ;;
   *) exit 1 ;;
@@ -194,7 +257,7 @@ run() {
     VD_REFRESH_NOW="$(ep "$now")" CALLS="$CALLS" NOTES="$NOTES" STUB_TREE="$TREE" \
     STUB_EXPIRIES="$TMP/expiries" STUB_INSTALLED="$TMP/installed" \
     ${STUB_DEVICE:+STUB_DEVICE=$STUB_DEVICE} ${STUB_BUILD_FAIL:+STUB_BUILD_FAIL=1} \
-    ${STUB_INSTALL_FAIL:+STUB_INSTALL_FAIL=1} \
+    ${STUB_INSTALL_FAIL:+STUB_INSTALL_FAIL=1} ${STUB_APPS_LOCKED:+STUB_APPS_LOCKED=1} \
     "$REFRESH" "$@" 2>&1)
   RC=$?
 }
@@ -287,6 +350,66 @@ reset 2026-10-30T12:00:00Z
 STUB_DEVICE=available run 2026-10-28T11:30:00Z
 eq    "phone available over Wi-Fi: installs" 0 "$RC"
 has   "phone available over Wi-Fi: install happened" "device install app" "$(cat "$CALLS")"
+lacks "phone available over Wi-Fi: no connection probe" "device info details" "$(cat "$CALLS")"
+
+reset 2026-10-30T12:00:00Z
+run 2026-10-28T10:00:00Z
+lacks "tunnel already up: no connection probe" "device info details" "$(cat "$CALLS")"
+
+# Fri 30 Oct: paired, unlocked, on Wi-Fi, but `list devices` said
+# "disconnected" because nothing had connected yet.
+reset 2026-10-30T12:00:00Z
+STUB_DEVICE=idle run 2026-10-28T10:00:00Z
+eq    "idle phone: connects, builds and installs" 0 "$RC"
+has   "idle phone: probes with a bounded timeout" "xcrun devicectl device info details --device TEST-DEVICE --timeout 30 --json-output" "$(cat "$CALLS")"
+has   "idle phone: install happened" "device install app" "$(cat "$CALLS")"
+eq    "idle phone: state has the new expiry" 2026-11-04T02:00:00Z "$(state_expiry)"
+eq    "idle phone: no notification" "" "$(cat "$NOTES")"
+has   "idle phone: logs the probe" "not connected; connecting (up to 30s)" "$(cat "$LOGF")"
+has   "idle phone: logs the connection" "iPhone TEST-DEVICE connected" "$(cat "$LOGF")"
+
+reset 2026-10-30T12:00:00Z
+STUB_DEVICE=stale run 2026-10-28T10:00:00Z
+eq    "probe returns stale state: exit 1" 1 "$RC"
+lacks "probe returns stale state: no build" "xcodebuild" "$(cat "$CALLS")"
+has   "probe returns stale state: not reachable" "iPhone keyboard re-sign pending: iPhone not reachable, connect or unlock it." "$(cat "$NOTES")"
+
+# A details.json left by an earlier connected run must not count.
+reset 2026-10-30T12:00:00Z
+mkdir -p "$TMP/home/Library/Caches/voice-dictate/ios-refresh"
+printf '{"result":{"identifier":"TEST-DEVICE","capabilities":[],"connectionProperties":{"pairingState":"paired","tunnelState":"connected"}}}' \
+  >"$TMP/home/Library/Caches/voice-dictate/ios-refresh/details.json"
+STUB_DEVICE=gone run 2026-10-28T10:00:00Z
+eq    "stale details.json from an earlier run: ignored" 1 "$RC"
+
+reset 2026-10-30T12:00:00Z
+STUB_DEVICE=locked run 2026-10-28T10:00:00Z
+eq    "locked in the window: exit 1" 1 "$RC"
+lacks "locked in the window: no build" "xcodebuild" "$(cat "$CALLS")"
+eq    "locked in the window: says it is locked" \
+      "iPhone keyboard re-sign pending: iPhone is locked, unlock it. Profile expires Fri 30 Oct 12:00." \
+      "$(cat "$NOTES")"
+has   "locked in the window: logged" "FAIL: iPhone is locked, unlock it" "$(cat "$LOGF")"
+has   "locked in the window: devicectl error in the log" "  | ERROR: The developer disk image could not be mounted" "$(cat "$LOGF")"
+
+reset 2026-10-30T12:00:00Z
+STUB_DEVICE=locked run 2026-10-28T14:00:00Z --force
+eq    "locked, forced outside the window: exit 1" 1 "$RC"
+has   "locked, forced outside the window: logged" "iPhone TEST-DEVICE is locked; not building" "$OUT"
+eq    "locked, forced outside the window: no notification" "" "$(cat "$NOTES")"
+
+reset 2026-10-30T12:00:00Z
+STUB_DEVICE=gone run 2026-10-28T10:00:00Z
+has   "gone: probe error in the log" "  | ERROR: Timed out waiting" "$(cat "$LOGF")"
+lacks "gone: not called locked" "locked" "$(cat "$NOTES")"
+
+reset 2026-10-30T12:00:00Z
+STUB_APPS_LOCKED=1 run 2026-10-28T10:00:00Z
+eq    "locked after install: exit 1" 1 "$RC"
+eq    "locked after install: says why it is unconfirmed" \
+      "iPhone keyboard re-sign pending: installed, but the iPhone is locked so the install could not be confirmed. Profile expires Fri 30 Oct 12:00." \
+      "$(cat "$NOTES")"
+eq    "locked after install: state unchanged" 2026-10-30T12:00:00Z "$(state_expiry)"
 
 reset 2026-10-30T12:00:00Z
 STUB_BUILD_FAIL=1 run 2026-10-28T10:00:00Z

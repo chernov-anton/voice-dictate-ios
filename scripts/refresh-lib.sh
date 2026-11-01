@@ -96,15 +96,17 @@ app_identifiers() { # <path/to/X.app>
   return 0
 }
 
-# Reads a `devicectl list devices --json-output` file. Succeeds when the device
-# is paired and either has a live tunnel or advertises app installation (what
-# devicectl's table shows as "connected" / "available (paired)").
+# Reads a `devicectl list devices --json-output` file, or the single-device
+# result of `devicectl device info details --json-output`. Succeeds when the
+# device is paired and either has a live tunnel or advertises app installation
+# (what devicectl's table shows as "connected" / "available (paired)").
 device_reachable() { # <json> <device-id>
   /usr/bin/python3 -I - "$1" "$2" <<'PY'
 import json, sys
 path, want = sys.argv[1], sys.argv[2]
 try:
-    devices = json.load(open(path))["result"]["devices"]
+    result = json.load(open(path))["result"]
+    devices = result["devices"] if "devices" in result else [result]
 except Exception:
     sys.exit(1)
 for d in devices:
@@ -120,6 +122,13 @@ for d in devices:
         sys.exit(0)
 sys.exit(1)
 PY
+}
+
+# Whether devicectl output (its text or --json-output files) says the phone is
+# locked, e.g. "developer disk image could not be mounted ... device is locked"
+# (kAMDMobileImageMounterDeviceLocked) or a passcode-protected error.
+says_locked() { # <file>...
+  grep -qiE 'DeviceLocked|device is locked|passcode protected|PasswordProtected' "$@" 2>/dev/null
 }
 
 # Reads a `devicectl device info apps --json-output` file.

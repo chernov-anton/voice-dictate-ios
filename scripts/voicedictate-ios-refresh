@@ -45,6 +45,7 @@ WINDOW_END_HOUR=12
 # succeeds the day's later runs skip.
 REFRESH_WITHIN_HOURS=100
 MIN_FRESH_HOURS=144           # a new build's profile must last at least 6 days
+PROBE_TIMEOUT=30              # seconds devicectl may take to connect to the phone
 LOG_MAX_BYTES=524288          # then the log rotates to .1
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -178,17 +179,36 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 # ---- phone reachable? -------------------------------------------------------
-if [ "$INSTALL" = 1 ]; then
-  if ! xcrun devicectl list devices --json-output "$WORK_DIR/devices.json" >/dev/null 2>&1 ||
-     ! device_reachable "$WORK_DIR/devices.json" "$DEVICE_ID"; then
-    # Due and in the window: you are likely at the Mac and can plug in or
-    # unlock the phone before the next run. A forced run outside it just logs.
-    if [ "$DECISION" = refresh ]; then
-      fail "iPhone not reachable, connect or unlock it"
-    fi
-    log "iPhone $DEVICE_ID not reachable; not building"
-    exit 1
+# `list devices` reports the last known state and never connects: a paired
+# phone on Wi-Fi reads "disconnected" until something opens a tunnel. So when
+# the list doesn't show it reachable, connect with `device info details` (a
+# few seconds; devicectl's own --timeout bounds it, macOS has no timeout(1))
+# and judge the fresh state that command returns.
+PROBE_LOG="$WORK_DIR/probe.log"
+phone_reachable() {
+  local list="$WORK_DIR/devices.json" details="$WORK_DIR/details.json"
+  rm -f "$list" "$details" "$PROBE_LOG"
+  xcrun devicectl list devices --json-output "$list" >/dev/null 2>&1 &&
+    device_reachable "$list" "$DEVICE_ID" && return 0
+  log "iPhone $DEVICE_ID not connected; connecting (up to ${PROBE_TIMEOUT}s)"
+  xcrun devicectl device info details --device "$DEVICE_ID" --timeout "$PROBE_TIMEOUT" \
+    --json-output "$details" >"$PROBE_LOG" 2>&1 &&
+    device_reachable "$details" "$DEVICE_ID" || return 1
+  log "iPhone $DEVICE_ID connected"
+}
+
+if [ "$INSTALL" = 1 ] && ! phone_reachable; then
+  grep -iE 'error|locked' "$PROBE_LOG" 2>/dev/null | tail -n 3 | cut -c1-300 | sed 's/^/  | /' >>"$LOG_FILE"
+  if says_locked "$PROBE_LOG" "$WORK_DIR/details.json"; then
+    STATE_TEXT="is locked" REASON="iPhone is locked, unlock it"
+  else
+    STATE_TEXT="not reachable" REASON="iPhone not reachable, connect or unlock it"
   fi
+  # Due and in the window: you are likely at the Mac and can plug in or
+  # unlock the phone before the next run. A forced run outside it just logs.
+  [ "$DECISION" = refresh ] && fail "$REASON"
+  log "iPhone $DEVICE_ID $STATE_TEXT; not building"
+  exit 1
 fi
 
 # ---- build committed code ---------------------------------------------------
@@ -279,9 +299,14 @@ if ! xcrun devicectl device install app --device "$DEVICE_ID" "$APP" \
   tail -n 5 "$BUILD_LOG" | sed 's/^/  | /' >>"$LOG_FILE"
   fail "install on the iPhone failed (see $LOG_FILE)"
 fi
+rm -f "$WORK_DIR/apps.json" "$WORK_DIR/apps.log"
 if ! xcrun devicectl device info apps --device "$DEVICE_ID" --bundle-id "$BUNDLE_ID" \
-       --json-output "$WORK_DIR/apps.json" >/dev/null 2>&1 ||
+       --json-output "$WORK_DIR/apps.json" >"$WORK_DIR/apps.log" 2>&1 ||
    ! app_installed "$WORK_DIR/apps.json" "$BUNDLE_ID"; then
+  # Listing apps needs the developer disk image, which won't mount while the
+  # phone is locked.
+  says_locked "$WORK_DIR/apps.log" "$WORK_DIR/apps.json" &&
+    fail "installed, but the iPhone is locked so the install could not be confirmed"
   fail "installed, but $BUNDLE_ID is not listed on the iPhone"
 fi
 state_write "$STATE_FILE" expiry "$NEW_EXPIRY" bundle_id "$BUNDLE_ID" commit "$COMMIT" \
