@@ -45,7 +45,11 @@ WINDOW_END_HOUR=12
 # succeeds the day's later runs skip.
 REFRESH_WITHIN_HOURS=100
 MIN_FRESH_HOURS=144           # a new build's profile must last at least 6 days
+MIN_FALLBACK_HOURS=24         # a shorter-lived first build still installs if valid this long
 PROBE_TIMEOUT=30              # seconds devicectl may take to connect to the phone
+ALERT_EVERY=3600              # at most one alert dialog per hour; notifications otherwise
+ALERT_TIMEOUT=600             # an unanswered alert counts as "Later" after 10 min
+MAX_RETRIES=3                 # "Retry" answers per run, so a run never hangs
 LOG_MAX_BYTES=524288          # then the log rotates to .1
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,18 +123,66 @@ notify() {
     -e 'end run' "$1" >/dev/null 2>&1 || true
 }
 
-# The one notification of a run: the re-sign didn't happen, when it must.
-fail() { # <short reason> -> notification + log, exit 1
+# Tests fix the time with VD_REFRESH_NOW, or move it during a run (a stub
+# alert answered "later") with VD_REFRESH_NOW_FILE.
+now() {
+  if [ -n "${VD_REFRESH_NOW_FILE:-}" ] && [ -s "$VD_REFRESH_NOW_FILE" ]; then cat "$VD_REFRESH_NOW_FILE"; return; fi
+  echo "${VD_REFRESH_NOW:-$(date +%s)}"
+}
+
+# Notifications vanish under Focus (e.g. while the display is shared), so a
+# failure that needs you raises a modal alert instead: in launchd runs and
+# --force runs from a terminal, at most once per ALERT_EVERY (the retry
+# alerts of the run that showed one excepted), else the notification.
+ALERT_FILE="$(dirname "$STATE_FILE")/ios-refresh-last-alert"
+ALERTED=0 RETRIES=0
+can_alert() {
+  [ -n "${VD_REFRESH_LAUNCHD:-}" ] || { [ "$FORCE" = 1 ] && [ -t 1 ]; }
+}
+
+tell_user() { # <reason> <what to do> [retry] -> 0 when the user chose Retry
+  local short="iPhone keyboard re-sign pending: $1." when t last answer
+  if [ -n "${EXPIRY:-}" ]; then when="Profile expires $(local_time "$EXPIRY")."; else when="Profile expiry unknown."; fi
+  t=$(now)
+  if ! can_alert; then notify "$short $when"; return 1; fi
+  last=$(cat "$ALERT_FILE" 2>/dev/null)
+  if [ "$ALERTED" = 0 ] && [ -n "$last" ] && [ -z "${last//[0-9]/}" ] && [ $((t - last)) -lt "$ALERT_EVERY" ]; then
+    log "an alert was shown less than $((ALERT_EVERY / 60)) min ago; notification only"
+    notify "$short $when"
+    return 1
+  fi
+  ALERTED=1
+  mkdir -p "$(dirname "$ALERT_FILE")" && echo "$t" >"$ALERT_FILE"
+  if [ -n "${EXPIRY:-}" ] && [ "$EXPIRY" -le "$t" ]; then
+    when="The profile expired $(local_time "$EXPIRY"); the keyboard won't open until a re-sign succeeds."
+  elif [ -n "${EXPIRY:-}" ]; then
+    when="The installed profile expires $(local_time "$EXPIRY"); then the keyboard stops working."
+  fi
+  answer=$(osascript -e 'on run argv' \
+    -e 'if item 3 of argv is "retry" then' -e 'set btns to {"Later", "Retry"}' -e 'else' -e 'set btns to {"OK"}' -e 'end if' \
+    -e 'activate' \
+    -e 'set r to display alert (item 1 of argv) message (item 2 of argv) as critical buttons btns default button (last item of btns) giving up after ((item 4 of argv) as integer)' \
+    -e 'if gave up of r then return "gave up"' \
+    -e 'return button returned of r' -e 'end run' \
+    "Voice Dictate: iPhone keyboard re-sign pending" \
+    "$1."$'\n\n'"$2${3:+ Then choose Retry.}"$'\n\n'"$when" "${3:+retry}" "$ALERT_TIMEOUT" 2>/dev/null)
+  log "alert answered: ${answer:-no answer}"
+  [ -n "${3:-}" ] && [ "$answer" = Retry ]
+}
+
+# The one message of a run: the re-sign didn't happen, when it must. With
+# [retry] (and retries left) it offers Retry and returns when that is chosen.
+fail() { # <short reason> [what to do] [retry] -> log + alert or notification, exit 1
+  local retry=""
   log "FAIL: $1"
-  if [ -n "${EXPIRY:-}" ]; then
-    notify "iPhone keyboard re-sign pending: $1. Profile expires $(local_time "$EXPIRY")."
-  else
-    notify "iPhone keyboard re-sign pending: $1. Profile expiry unknown."
+  [ -n "${3:-}" ] && [ "$RETRIES" -lt "$MAX_RETRIES" ] && retry=1
+  if tell_user "$1" "${2:-Details in $LOG_FILE.}" "$retry"; then
+    RETRIES=$((RETRIES + 1))
+    log "retry $RETRIES of $MAX_RETRIES, as asked"
+    return 0
   fi
   exit 1
 }
-
-now() { echo "${VD_REFRESH_NOW:-$(date +%s)}"; }
 
 NOW=$(now)
 
@@ -197,18 +249,29 @@ phone_reachable() {
   log "iPhone $DEVICE_ID connected"
 }
 
-if [ "$INSTALL" = 1 ] && ! phone_reachable; then
+UNLOCK_ADVICE="Unlock your iPhone and keep it unlocked until the install finishes."
+CONNECT_ADVICE="Connect the iPhone by USB, or unlock it on the same Wi-Fi as this Mac."
+phone_problem() { # after phone_reachable failed: log why, set STATE_TEXT REASON ADVICE
   grep -iE 'error|locked' "$PROBE_LOG" 2>/dev/null | tail -n 3 | cut -c1-300 | sed 's/^/  | /' >>"$LOG_FILE"
   if says_locked "$PROBE_LOG" "$WORK_DIR/details.json"; then
-    STATE_TEXT="is locked" REASON="iPhone is locked, unlock it"
+    STATE_TEXT="is locked" REASON="iPhone is locked, unlock it" ADVICE=$UNLOCK_ADVICE
   else
-    STATE_TEXT="not reachable" REASON="iPhone not reachable, connect or unlock it"
+    STATE_TEXT="not reachable" REASON="iPhone not reachable, connect or unlock it" ADVICE=$CONNECT_ADVICE
   fi
-  # Due and in the window: you are likely at the Mac and can plug in or
-  # unlock the phone before the next run. A forced run outside it just logs.
-  [ "$DECISION" = refresh ] && fail "$REASON"
-  log "iPhone $DEVICE_ID $STATE_TEXT; not building"
-  exit 1
+}
+
+if [ "$INSTALL" = 1 ]; then
+  until phone_reachable; do
+    phone_problem
+    # Due and in the window: you are likely at the Mac and can plug in or
+    # unlock the phone now or before the next run. A forced run outside it
+    # just logs.
+    if [ "$DECISION" != refresh ]; then
+      log "iPhone $DEVICE_ID $STATE_TEXT; not building"
+      exit 1
+    fi
+    fail "$REASON" "$ADVICE" retry
+  done
 fi
 
 # ---- build committed code ---------------------------------------------------
@@ -219,7 +282,8 @@ SRC="$WORK_DIR/src"
 DERIVED="$WORK_DIR/DerivedData"
 BUILD_LOG="$WORK_DIR/build.log"
 APP="$DERIVED/Build/Products/Debug-iphoneos/VoiceDictate.app"
-trap 'rm -rf "$SRC"' EXIT
+FIRST_DIR="$WORK_DIR/first-build"
+trap 'rm -rf "$SRC" "$FIRST_DIR"' EXIT
 
 rm -rf "$SRC" && mkdir -p "$SRC" || fail "cannot create $SRC"
 git -C "$REPO" archive --format=tar "$COMMIT" | tar -x -C "$SRC" || fail "git archive of $REF failed"
@@ -237,19 +301,34 @@ build() {
   } >"$BUILD_LOG" 2>&1 && [ -d "$APP" ]
 }
 
-build_failed() {
+build_error() { # logs the build's last error lines; prints the first as a reason
   local first
   first=$(grep -m1 -E '(error|fatal):' "$BUILD_LOG" | sed -e 's/^.*error: //' -e 's/^.*fatal: //' | cut -c1-160)
   grep -E '(error|fatal):' "$BUILD_LOG" | tail -n 5 | sed 's/^/  | /' >>"$LOG_FILE"
-  fail "build failed: ${first:-see $BUILD_LOG}"
+  echo "build failed: ${first:-see $BUILD_LOG}"
 }
+
+build_advice() {
+  if grep -qE 'No Account|Accounts settings' "$BUILD_LOG"; then
+    echo "Sign in to Xcode > Settings > Accounts with your Apple account; the next run builds again."
+  else
+    echo "Details in $BUILD_LOG."
+  fi
+}
+
+build_failed() { fail "$(build_error)" "$(build_advice)"; }
 
 # Xcode keeps using a cached profile while it is still valid, so a refresh a
 # few days before expiry can come back with the same old date. Then move the
 # cached profiles for these app IDs aside and build once more, which makes
-# Xcode fetch a new one.
+# Xcode fetch a new one. If that rebuild doesn't give a fresh profile (e.g.
+# Xcode is signed out: "No Accounts"), the profiles go back and the first
+# build installs instead, when it is still good for MIN_FALLBACK_HOURS and
+# outlasts the installed one.
+STALE_DIR="$WORK_DIR/stale-profiles"
+PURGED=""                     # basenames this run moved to STALE_DIR
 purge_stale_profiles() {
-  local ids f id exp ep moved=0 dest="$WORK_DIR/stale-profiles"
+  local ids f id exp ep moved=0 dest=$STALE_DIR
   ids=$(app_identifiers "$APP")
   [ -n "$ids" ] && [ -d "$PROFILES_DIR" ] || return 1
   mkdir -p "$dest"
@@ -259,9 +338,30 @@ purge_stale_profiles() {
     printf '%s\n' "$ids" | grep -qxF "$id" || continue
     exp=$(profile_expiry "$f") && ep=$(iso_to_epoch "$exp") || continue
     [ $((ep - NOW)) -lt $((MIN_FRESH_HOURS * 3600)) ] || continue
-    mv -f "$f" "$dest/" && moved=$((moved + 1)) && log "moved cached profile $(basename "$f") ($id, expires $exp) to $dest"
+    mv -f "$f" "$dest/" && moved=$((moved + 1)) && PURGED="$PURGED$(basename "$f")"$'\n' &&
+      log "moved cached profile $(basename "$f") ($id, expires $exp) to $dest"
   done
   [ "$moved" -gt 0 ]
+}
+
+restore_profiles() {
+  local name
+  while IFS= read -r name; do
+    [ -n "$name" ] && [ -f "$STALE_DIR/$name" ] || continue
+    mv -n "$STALE_DIR/$name" "$PROFILES_DIR/" && log "moved cached profile $name back to $PROFILES_DIR"
+  done <<<"$PURGED"
+}
+
+use_first_build() { # <why the rebuild didn't help> [what to do]; returns when it installs the first build, else fails
+  local ep
+  if ep=$(iso_to_epoch "$FIRST_EXPIRY") && [ $((ep - NOW)) -ge $((MIN_FALLBACK_HOURS * 3600)) ] &&
+     { [ -z "$EXPIRY" ] || [ "$ep" -gt "$EXPIRY" ]; } &&
+     rm -rf "$APP" && ditto "$FIRST_DIR/VoiceDictate.app" "$APP"; then
+    NEW_EXPIRY=$FIRST_EXPIRY
+    log "$1; falling back to the first build: shorter-lived profile valid until $FIRST_EXPIRY"
+    return 0
+  fi
+  fail "$1" "${2:-}"
 }
 
 is_fresh() { # <expiry ISO>
@@ -273,10 +373,22 @@ build || build_failed
 NEW_EXPIRY=$(app_expiry "$APP") || fail "built app has no readable provisioning profile"
 if ! is_fresh "$NEW_EXPIRY"; then
   log "built profile expires $NEW_EXPIRY, less than ${MIN_FRESH_HOURS}h away"
-  purge_stale_profiles || fail "Xcode reused a profile expiring $NEW_EXPIRY and none could be purged"
-  build || build_failed
-  NEW_EXPIRY=$(app_expiry "$APP") || fail "built app has no readable provisioning profile"
-  is_fresh "$NEW_EXPIRY" || fail "Xcode still signs with a profile expiring $NEW_EXPIRY"
+  FIRST_EXPIRY=$NEW_EXPIRY
+  rm -rf "$FIRST_DIR" && mkdir -p "$FIRST_DIR" && ditto "$APP" "$FIRST_DIR/VoiceDictate.app" ||
+    fail "cannot copy the first build to $FIRST_DIR"
+  if ! purge_stale_profiles; then
+    use_first_build "Xcode reused a profile expiring $FIRST_EXPIRY and none could be purged"
+  elif ! build; then
+    WHY=$(build_error)
+    restore_profiles
+    use_first_build "rebuild after purging: $WHY" "$(build_advice)"
+  elif ! NEW_EXPIRY=$(app_expiry "$APP"); then
+    restore_profiles
+    use_first_build "rebuilt app has no readable provisioning profile"
+  elif ! is_fresh "$NEW_EXPIRY"; then
+    restore_profiles
+    use_first_build "Xcode still signs with a profile expiring $NEW_EXPIRY"
+  fi
 fi
 BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw -o - "$APP/Info.plist") || fail "built app has no bundle ID"
 log "built $BUNDLE_ID ${COMMIT:0:12}: profile valid until $NEW_EXPIRY"
@@ -294,21 +406,51 @@ if [ "$FORCE" = 0 ] && [ "$(decide "$NOW" "$EXPIRY")" = wait ]; then
 fi
 
 # ---- install over the top ---------------------------------------------------
-if ! xcrun devicectl device install app --device "$DEVICE_ID" "$APP" \
-     --json-output "$WORK_DIR/install.json" >>"$BUILD_LOG" 2>&1; then
-  tail -n 5 "$BUILD_LOG" | sed 's/^/  | /' >>"$LOG_FILE"
-  fail "install on the iPhone failed (see $LOG_FILE)"
-fi
-rm -f "$WORK_DIR/apps.json" "$WORK_DIR/apps.log"
-if ! xcrun devicectl device info apps --device "$DEVICE_ID" --bundle-id "$BUNDLE_ID" \
-       --json-output "$WORK_DIR/apps.json" >"$WORK_DIR/apps.log" 2>&1 ||
-   ! app_installed "$WORK_DIR/apps.json" "$BUNDLE_ID"; then
-  # Listing apps needs the developer disk image, which won't mount while the
-  # phone is locked.
-  says_locked "$WORK_DIR/apps.log" "$WORK_DIR/apps.json" &&
-    fail "installed, but the iPhone is locked so the install could not be confirmed"
-  fail "installed, but $BUNDLE_ID is not listed on the iPhone"
-fi
+# Sets REASON and ADVICE on failure. Installing and listing apps need the
+# developer disk image, which won't mount while the phone is locked.
+install_app() {
+  local out="$WORK_DIR/install.log"
+  rm -f "$WORK_DIR/install.json" "$WORK_DIR/apps.json" "$WORK_DIR/apps.log"
+  if ! xcrun devicectl device install app --device "$DEVICE_ID" "$APP" \
+       --json-output "$WORK_DIR/install.json" >"$out" 2>&1; then
+    tail -n 5 "$out" | sed 's/^/  | /' >>"$LOG_FILE"
+    if says_locked "$out" "$WORK_DIR/install.json"; then
+      REASON="install failed: the iPhone is locked" ADVICE=$UNLOCK_ADVICE
+    else
+      REASON="install on the iPhone failed (see $LOG_FILE)" ADVICE=$CONNECT_ADVICE
+    fi
+    return 1
+  fi
+  if ! xcrun devicectl device info apps --device "$DEVICE_ID" --bundle-id "$BUNDLE_ID" \
+         --json-output "$WORK_DIR/apps.json" >"$WORK_DIR/apps.log" 2>&1 ||
+     ! app_installed "$WORK_DIR/apps.json" "$BUNDLE_ID"; then
+    if says_locked "$WORK_DIR/apps.log" "$WORK_DIR/apps.json"; then
+      REASON="installed, but the iPhone is locked so the install could not be confirmed" ADVICE=$UNLOCK_ADVICE
+    else
+      REASON="installed, but $BUNDLE_ID is not listed on the iPhone" ADVICE="Details in $LOG_FILE."
+    fi
+    return 1
+  fi
+}
+
+# Retry (offered in the alert, up to MAX_RETRIES times a run) reconnects and
+# installs the same build again, but not once the window has ended while the
+# alert waited.
+retry_in_window() {
+  NOW=$(now)
+  if [ "$FORCE" = 0 ] && [ "$(decide "$NOW" "$EXPIRY")" = wait ]; then
+    log "install window ended while the alert waited; installing next run"
+    exit 1
+  fi
+}
+until install_app; do
+  fail "$REASON" "$ADVICE" retry
+  until phone_reachable; do
+    phone_problem
+    fail "$REASON" "$ADVICE" retry
+  done
+  retry_in_window             # right before installing: reconnecting takes time too
+done
 state_write "$STATE_FILE" expiry "$NEW_EXPIRY" bundle_id "$BUNDLE_ID" commit "$COMMIT" \
   installed_at "$(epoch_to_iso "$NOW")" device "$DEVICE_ID" source "voicedictate-ios-refresh" ||
   fail "installed, but could not write $STATE_FILE"

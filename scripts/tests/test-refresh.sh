@@ -156,12 +156,27 @@ PASS=$((PASS + $(grep -c '^ok' "$TMP/sweep.out"))); FAIL=$((FAIL + $(grep -c '^F
 
 # ---- stubs ------------------------------------------------------------------
 STUBS="$TMP/stubs"; mkdir -p "$STUBS"
-CALLS="$TMP/calls.log" NOTES="$TMP/notifications.log"
+CALLS="$TMP/calls.log" NOTES="$TMP/notifications.log" ALERTS="$TMP/alerts.log" ANSWERS="$TMP/answers"
 stub() { printf '#!/bin/bash\n%s\n' "$2" >"$STUBS/$1"; chmod +x "$STUBS/$1"; }
 
 # Profiles are plain plists here; `security cms -D -i f` just prints them.
 stub security 'echo "security $*" >>"$CALLS"; [ "$1 $2 $3" = "cms -D -i" ] && cat "$4"'
-stub osascript 'echo "${@: -1}" >>"$NOTES"'
+# osascript: a notification logs its text to $NOTES; an alert logs
+# "title|message|retry:timeout" to $ALERTS and answers with the next line of
+# $STUB_ANSWERS (none = no answer). "Retry unlock" also unlocks the phone,
+# "Retry at <epoch>" also moves the script's clock there.
+stub osascript 'case "$*" in
+  *"display alert"*)
+    set -- "${@: -4}"
+    printf "%s|%s|%s\n" "$1" "$(printf %s "$2" | tr "\n" " ")" "$3:$4" >>"$ALERTS"
+    a=$(head -n1 "$STUB_ANSWERS"); sed -i "" 1d "$STUB_ANSWERS"
+    case "$a" in
+      "Retry unlock") rm -f "$STUB_LOCKED"; a=Retry ;;
+      "Retry at "*) echo "${a#Retry at }" >"$VD_REFRESH_NOW_FILE"; a=Retry ;;
+    esac
+    printf "%s\n" "$a" ;;
+  *) echo "${@: -1}" >>"$NOTES" ;;
+esac'
 stub xcodegen 'echo "xcodegen $*" >>"$CALLS"; [ -z "${STUB_XCODEGEN_FAIL:-}" ]'
 # git: rev-parse/symbolic-ref answer; archive tars the fixture tree.
 stub git 'echo "git $*" >>"$CALLS"
@@ -173,12 +188,13 @@ case "$1" in
   *) exit 1 ;;
 esac'
 # xcodebuild: makes an app + appex whose profile expiries are the next line
-# of $STUB_EXPIRIES (app;appex), or fails like a signed-out Xcode.
+# of $STUB_EXPIRIES (app;appex), or fails like a signed-out Xcode (always
+# with $STUB_BUILD_FAIL, or when that line is "fail").
 stub xcodebuild 'echo "xcodebuild $*" >>"$CALLS"
-if [ -n "${STUB_BUILD_FAIL:-}" ]; then
-  echo "error: No Account for Team \"TEAM\". Add a new account in Accounts settings."; exit 65; fi
 dd=""; while [ $# -gt 0 ]; do [ "$1" = -derivedDataPath ] && dd=$2; shift; done
 line=$(head -n1 "$STUB_EXPIRIES"); sed -i "" 1d "$STUB_EXPIRIES"
+if [ -n "${STUB_BUILD_FAIL:-}" ] || [ "$line" = fail ]; then
+  echo "error: No Account for Team \"TEAM\". Add a new account in Accounts settings."; exit 65; fi
 app="$dd/Build/Products/Debug-iphoneos/VoiceDictate.app"
 mkdir -p "$app/PlugIns/DictationKeyboard.appex"
 prof() { printf "<plist version=\"1.0\"><dict><key>ExpirationDate</key><date>%s</date><key>Entitlements</key><dict><key>application-identifier</key><string>%s</string></dict></dict></plist>\n" "$1" "$2"; }
@@ -193,6 +209,8 @@ printf "<plist version=\"1.0\"><dict><key>CFBundleIdentifier</key><string>test.a
 #   stale      idle, and details answers with the same stale state
 #   locked     idle, and details fails because the phone is locked
 #   gone       unavailable, and details times out
+# While the file $STUB_LOCKED exists the phone is locked: install fails as
+# it does then, and "locked" probes fail; once it is gone they connect.
 # install fails with $STUB_INSTALL_FAIL, apps lists test.app once installed,
 # or fails as on a locked phone with $STUB_APPS_LOCKED.
 stub xcrun 'echo "xcrun $*" >>"$CALLS"
@@ -202,6 +220,7 @@ installapp="[{\"featureIdentifier\":\"com.apple.coredevice.feature.installapp\"}
 connectonly="[{\"featureIdentifier\":\"com.apple.coredevice.feature.connectdevice\"}]"
 dev() { printf "{\"identifier\":\"TEST-DEVICE\",\"capabilities\":%s,\"connectionProperties\":{\"pairingState\":\"paired\",\"tunnelState\":\"%s\"}}" "$2" "$1"; }
 state=${STUB_DEVICE:-connected}
+[ "$state" = locked ] && [ -n "${STUB_LOCKED:-}" ] && [ ! -f "$STUB_LOCKED" ] && state=idle
 case "$args" in
   "list devices"*)
     case "$state" in
@@ -224,6 +243,8 @@ case "$args" in
     esac ;;
   "device install app"*)
     [ -z "${STUB_INSTALL_FAIL:-}" ] || { echo "ERROR: install failed"; exit 1; }
+    if [ -n "${STUB_LOCKED:-}" ] && [ -f "$STUB_LOCKED" ]; then
+      echo "ERROR: The developer disk image could not be mounted on this device. (kAMDMobileImageMounterDeviceLocked: The device is locked.)"; exit 1; fi
     touch "$STUB_INSTALLED"; echo "{}" >"$out" ;;
   "device info apps"*)
     if [ -n "${STUB_APPS_LOCKED:-}" ]; then
@@ -241,25 +262,30 @@ PROFILES="$TMP/home/Library/Developer/Xcode/UserData/Provisioning Profiles"
 
 # reset <state expiry or ""> ; resets home, logs and stub inputs
 reset() {
-  rm -rf "$TMP/home" "$CALLS" "$NOTES" "$TMP/installed"; mkdir -p "$TMP/home"; : >"$CALLS"; : >"$NOTES"
+  rm -rf "$TMP/home" "$CALLS" "$NOTES" "$ALERTS" "$TMP/installed" "$TMP/locked" "$TMP/now"
+  mkdir -p "$TMP/home"; : >"$CALLS"; : >"$NOTES"; : >"$ALERTS"; : >"$ANSWERS"
   printf '%s\n' "2026-11-04T02:00:00Z;2026-11-04T02:00:01Z" >"$TMP/expiries"
   if [ -n "$1" ]; then
     mkdir -p "$(dirname "$STATE")"
     printf '{"expiry": "%s", "bundle_id": "test.app", "device": "%s"}\n' "$1" "${2:-TEST-DEVICE}" >"$STATE"
   fi
 }
-# run <now ISO> [args...] ; sets OUT and RC. DEVICE= overrides the device.
+# run <now ISO> [args...] ; sets OUT and RC. DEVICE= overrides the device,
+# LAUNCHD=1 runs as the LaunchAgent does, LOCKED=1 starts with a locked phone.
 DEVICE=TEST-DEVICE
 run() {
   local now=$1; shift
+  [ -z "${LOCKED:-}" ] || touch "$TMP/locked"
   OUT=$(env -i HOME="$TMP/home" TZ=UTC PATH="$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" \
     VD_REFRESH_TEST_STUBS="$STUBS" VD_REFRESH_REPO="$REPO" VD_REFRESH_DEVICE="$DEVICE" \
-    VD_REFRESH_NOW="$(ep "$now")" CALLS="$CALLS" NOTES="$NOTES" STUB_TREE="$TREE" \
+    VD_REFRESH_NOW="$(ep "$now")" VD_REFRESH_NOW_FILE="$TMP/now" CALLS="$CALLS" NOTES="$NOTES" STUB_TREE="$TREE" \
     STUB_EXPIRIES="$TMP/expiries" STUB_INSTALLED="$TMP/installed" \
+    ALERTS="$ALERTS" STUB_ANSWERS="$ANSWERS" ${LOCKED:+STUB_LOCKED=$TMP/locked} ${LAUNCHD:+VD_REFRESH_LAUNCHD=1} \
     ${STUB_DEVICE:+STUB_DEVICE=$STUB_DEVICE} ${STUB_BUILD_FAIL:+STUB_BUILD_FAIL=1} \
     ${STUB_INSTALL_FAIL:+STUB_INSTALL_FAIL=1} ${STUB_APPS_LOCKED:+STUB_APPS_LOCKED=1} \
     "$REFRESH" "$@" 2>&1)
   RC=$?
+  rm -f "$TMP/locked" "$TMP/now"
 }
 state_expiry() { plutil -extract expiry raw -o - "$STATE" 2>/dev/null; }
 
@@ -457,6 +483,142 @@ run 2026-10-28T10:00:00Z
 eq    "stale, nothing to purge: exit 1" 1 "$RC"
 has   "stale, nothing to purge: notifies" "Xcode reused a profile expiring 2026-10-30T12:00:00Z" "$(cat "$NOTES")"
 lacks "stale, nothing to purge: no install" "device install" "$(cat "$CALLS")"
+
+# The rebuild after purging fails (Xcode signed out, 6 Nov): the purged
+# profiles go back and the first, shorter-lived build installs.
+cached_profiles() {
+  mkdir -p "$PROFILES"
+  p 2026-11-01T12:00:00Z TEAM.test.app >"$PROFILES/cached-app.mobileprovision"
+  p 2026-11-01T12:00:00Z TEAM.test.app.keyboard >"$PROFILES/cached-kb.mobileprovision"
+}
+FIRST_COPY="$TMP/home/Library/Caches/voice-dictate/ios-refresh/first-build"
+reset 2026-10-30T12:00:00Z
+cached_profiles
+printf '%s\n' "2026-11-01T12:00:00Z;2026-11-01T12:00:00Z" fail >"$TMP/expiries"
+run 2026-10-28T10:00:00Z
+eq    "rebuild fails: exit 0" 0 "$RC"
+eq    "rebuild fails: built twice" 2 "$(grep -c '^xcodebuild' "$CALLS")"
+eq    "rebuild fails: purged profiles moved back" "cached-app.mobileprovision cached-kb.mobileprovision" "$(cd "$PROFILES" && echo *)"
+has   "rebuild fails: logs why" "rebuild after purging: build failed: No Account for Team" "$(cat "$LOGF")"
+has   "rebuild fails: logs the fallback" "falling back to the first build: shorter-lived profile valid until 2026-11-01T12:00:00Z" "$(cat "$LOGF")"
+has   "rebuild fails: first build installed" "device install app" "$(cat "$CALLS")"
+eq    "rebuild fails: state has the first build's expiry" 2026-11-01T12:00:00Z "$(state_expiry)"
+eq    "rebuild fails: copy of the first build removed" no "$([ -d "$FIRST_COPY" ] && echo yes || echo no)"
+eq    "rebuild fails: no notification" "" "$(cat "$NOTES")"
+
+reset 2026-10-30T12:00:00Z
+cached_profiles
+printf '%s\n' "2026-10-29T09:00:00Z;2026-10-29T09:00:00Z" fail >"$TMP/expiries"
+run 2026-10-28T10:00:00Z
+eq    "rebuild fails, first build < 24h: exit 1" 1 "$RC"
+has   "rebuild fails, first build < 24h: notifies" "re-sign pending: rebuild after purging: build failed: No Account" "$(cat "$NOTES")"
+lacks "rebuild fails, first build < 24h: no install" "device install" "$(cat "$CALLS")"
+eq    "rebuild fails, first build < 24h: profiles moved back" "cached-app.mobileprovision cached-kb.mobileprovision" "$(cd "$PROFILES" && echo *)"
+eq    "rebuild fails, first build < 24h: state unchanged" 2026-10-30T12:00:00Z "$(state_expiry)"
+
+reset 2026-11-01T12:00:00Z
+cached_profiles
+printf '%s\n' "2026-11-01T12:00:00Z;2026-11-01T12:00:00Z" fail >"$TMP/expiries"
+run 2026-10-28T10:00:00Z
+eq    "rebuild fails, first build not newer than installed: exit 1" 1 "$RC"
+lacks "rebuild fails, first build not newer than installed: no install" "device install" "$(cat "$CALLS")"
+
+# ---- alerts -----------------------------------------------------------------
+# 4-6 Nov: the phone was locked at install time, and the notification saying
+# so was hidden by Focus while the display was shared. LaunchAgent runs now
+# raise a modal alert that can retry the install.
+ALERT_STAMP="$TMP/home/Library/Application Support/voice-dictate/ios-refresh-last-alert"
+reset 2026-10-30T12:00:00Z
+echo "Retry unlock" >"$ANSWERS"
+LAUNCHD=1 LOCKED=1 run 2026-10-28T10:00:00Z
+eq    "locked install, Retry after unlocking: exit 0" 0 "$RC"
+eq    "locked install, Retry after unlocking: built once" 1 "$(grep -c '^xcodebuild' "$CALLS")"
+eq    "locked install, Retry after unlocking: installed twice" 2 "$(grep -c 'device install app' "$CALLS")"
+eq    "locked install, Retry after unlocking: one alert" 1 "$(wc -l <"$ALERTS" | tr -d ' ')"
+has   "locked install, Retry after unlocking: alert says why" "|install failed: the iPhone is locked." "$(cat "$ALERTS")"
+has   "locked install, Retry after unlocking: alert says what to do" "Unlock your iPhone and keep it unlocked until the install finishes. Then choose Retry." "$(cat "$ALERTS")"
+has   "locked install, Retry after unlocking: alert has the expiry" "The installed profile expires Fri 30 Oct 12:00" "$(cat "$ALERTS")"
+has   "locked install, Retry after unlocking: Retry offered, gives up after 10 min" "|retry:600" "$(cat "$ALERTS")"
+eq    "locked install, Retry after unlocking: no notification" "" "$(cat "$NOTES")"
+eq    "locked install, Retry after unlocking: state updated" 2026-11-04T02:00:00Z "$(state_expiry)"
+has   "locked install, Retry after unlocking: retry logged" "retry 1 of 3, as asked" "$(cat "$LOGF")"
+eq    "locked install, Retry after unlocking: alert time stored" "$(ep 2026-10-28T10:00:00Z)" "$(cat "$ALERT_STAMP")"
+
+reset 2026-10-30T12:00:00Z
+echo Later >"$ANSWERS"
+LAUNCHD=1 LOCKED=1 run 2026-10-28T10:00:00Z
+eq    "locked install, Later: exit 1" 1 "$RC"
+eq    "locked install, Later: installed once" 1 "$(grep -c 'device install app' "$CALLS")"
+has   "locked install, Later: logged" "alert answered: Later" "$(cat "$LOGF")"
+eq    "locked install, Later: state unchanged" 2026-10-30T12:00:00Z "$(state_expiry)"
+
+reset 2026-10-30T12:00:00Z
+LAUNCHD=1 LOCKED=1 run 2026-10-28T10:00:00Z
+eq    "locked install, unanswered: exit 1" 1 "$RC"
+has   "locked install, unanswered: logged" "alert answered: no answer" "$(cat "$LOGF")"
+
+reset 2026-10-30T12:00:00Z
+printf 'Retry\nRetry\nRetry\nRetry\n' >"$ANSWERS"
+LAUNCHD=1 LOCKED=1 run 2026-10-28T10:00:00Z
+eq    "locked install, Retry forever: exit 1" 1 "$RC"
+eq    "locked install, Retry forever: 1 + 3 installs" 4 "$(grep -c 'device install app' "$CALLS")"
+eq    "locked install, Retry forever: 4 alerts" 4 "$(wc -l <"$ALERTS" | tr -d ' ')"
+has   "locked install, Retry forever: the last one has no Retry" "|:600" "$(tail -n1 "$ALERTS")"
+lacks "locked install, Retry forever: nor says to choose it" "Then choose Retry" "$(tail -n1 "$ALERTS")"
+
+# Retry answered after the window ended: no install outside it.
+reset 2026-10-30T12:00:00Z
+echo "Retry at $(ep 2026-10-28T12:01:00Z)" >"$ANSWERS"
+LAUNCHD=1 LOCKED=1 run 2026-10-28T11:55:00Z
+eq    "Retry after noon: exit 1" 1 "$RC"
+eq    "Retry after noon: no second install" 1 "$(grep -c 'device install app' "$CALLS")"
+has   "Retry after noon: logged" "install window ended while the alert waited; installing next run" "$(cat "$LOGF")"
+
+# At most one alert an hour; between them the failure still notifies.
+reset 2026-10-30T12:00:00Z
+printf '%s\n' "2026-11-04T02:00:00Z;2026-11-04T02:00:01Z" "2026-11-04T02:00:00Z;2026-11-04T02:00:01Z" "2026-11-04T02:00:00Z;2026-11-04T02:00:01Z" >"$TMP/expiries"
+LAUNCHD=1 LOCKED=1 run 2026-10-28T10:00:00Z
+LAUNCHD=1 LOCKED=1 run 2026-10-28T10:30:00Z
+eq    "throttle: 10:30 shows no second alert" 1 "$(wc -l <"$ALERTS" | tr -d ' ')"
+eq    "throttle: 10:30 notifies instead" \
+      "iPhone keyboard re-sign pending: install failed: the iPhone is locked. Profile expires Fri 30 Oct 12:00." "$(cat "$NOTES")"
+has   "throttle: 10:30 logs why" "notification only" "$(cat "$LOGF")"
+LAUNCHD=1 LOCKED=1 run 2026-10-28T11:00:00Z
+eq    "throttle: 11:00 alerts again" 2 "$(wc -l <"$ALERTS" | tr -d ' ')"
+
+reset 2026-10-30T12:00:00Z
+echo "Retry unlock" >"$ANSWERS"
+STUB_DEVICE=locked LAUNCHD=1 LOCKED=1 run 2026-10-28T10:00:00Z
+eq    "locked before building, Retry after unlocking: exit 0" 0 "$RC"
+has   "locked before building, Retry after unlocking: alert says why" "|iPhone is locked, unlock it." "$(cat "$ALERTS")"
+eq    "locked before building, Retry after unlocking: built and installed once" "1 1" \
+      "$(grep -c '^xcodebuild' "$CALLS") $(grep -c 'device install app' "$CALLS")"
+
+reset 2026-10-30T12:00:00Z
+STUB_DEVICE=gone LAUNCHD=1 run 2026-10-28T10:00:00Z
+eq    "unreachable, alert: exit 1" 1 "$RC"
+has   "unreachable, alert: says to connect" "Connect the iPhone by USB, or unlock it on the same Wi-Fi as this Mac. Then choose Retry." "$(cat "$ALERTS")"
+lacks "unreachable, alert: no build" "xcodebuild" "$(cat "$CALLS")"
+
+reset 2026-10-27T13:00:00Z
+STUB_BUILD_FAIL=1 LAUNCHD=1 run 2026-10-28T10:00:00Z
+eq    "signed out of Xcode, alert: exit 1" 1 "$RC"
+has   "signed out of Xcode, alert: says to sign in" "Sign in to Xcode > Settings > Accounts with your Apple account" "$(cat "$ALERTS")"
+has   "signed out of Xcode, alert: no Retry" "|:600" "$(cat "$ALERTS")"
+has   "signed out of Xcode, alert: profile already expired" "The profile expired Tue 27 Oct 13:00" "$(cat "$ALERTS")"
+eq    "signed out of Xcode, alert: no notification" "" "$(cat "$NOTES")"
+
+# Outside launchd (and not a --force run in a terminal): notifications only.
+reset 2026-10-30T12:00:00Z
+echo Retry >"$ANSWERS"
+LOCKED=1 run 2026-10-28T10:00:00Z
+eq    "manual run, locked install: exit 1" 1 "$RC"
+eq    "manual run, locked install: no alert" "" "$(cat "$ALERTS")"
+has   "manual run, locked install: notifies" "install failed: the iPhone is locked" "$(cat "$NOTES")"
+
+reset 2026-10-30T12:00:00Z
+STUB_DEVICE=locked LAUNCHD=1 LOCKED=1 run 2026-10-28T14:00:00Z --force
+eq    "locked, forced outside the window under launchd: no alert" "1:" "$RC:$(cat "$ALERTS")"
 
 reset 2026-10-31T19:00:26Z OTHER-DEVICE
 run 2026-10-28T10:00:00Z --dry-run
