@@ -159,6 +159,15 @@ STUBS="$TMP/stubs"; mkdir -p "$STUBS"
 CALLS="$TMP/calls.log" NOTES="$TMP/notifications.log" ALERTS="$TMP/alerts.log" ANSWERS="$TMP/answers"
 stub() { printf '#!/bin/bash\n%s\n' "$2" >"$STUBS/$1"; chmod +x "$STUBS/$1"; }
 
+# defaults: Xcode's account lists, signed in unless $STUB_XCODE_ACCOUNTS is
+# "none" (signed out, as on 9 Nov) or "missing" (no such key). Not logged
+# to $CALLS: every run reads it.
+stub defaults '[ "$*" = "read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists" ] || exit 1
+case "${STUB_XCODE_ACCOUNTS:-signed-in}" in
+  none) printf "{\n    \"IDE.Identifiers.Prod\" =     (\n    );\n}\n" ;;
+  missing) echo "The domain/default pair of (com.apple.dt.Xcode, DVTDeveloperAccountManagerAppleIDLists) does not exist" >&2; exit 1 ;;
+  *) printf "{\n    \"IDE.Identifiers.Prod\" =     (\n                {\n            identifier = \"X\";\n            username = \"someone@example.com\";\n        }\n    );\n}\n" ;;
+esac'
 # Profiles are plain plists here; `security cms -D -i f` just prints them.
 stub security 'echo "security $*" >>"$CALLS"; [ "$1 $2 $3" = "cms -D -i" ] && cat "$4"'
 # osascript: a notification logs its text to $NOTES; an alert logs
@@ -281,6 +290,7 @@ run() {
     VD_REFRESH_NOW="$(ep "$now")" VD_REFRESH_NOW_FILE="$TMP/now" CALLS="$CALLS" NOTES="$NOTES" STUB_TREE="$TREE" \
     STUB_EXPIRIES="$TMP/expiries" STUB_INSTALLED="$TMP/installed" \
     ALERTS="$ALERTS" STUB_ANSWERS="$ANSWERS" ${LOCKED:+STUB_LOCKED=$TMP/locked} ${LAUNCHD:+VD_REFRESH_LAUNCHD=1} \
+    ${STUB_XCODE_ACCOUNTS:+STUB_XCODE_ACCOUNTS=$STUB_XCODE_ACCOUNTS} \
     ${STUB_DEVICE:+STUB_DEVICE=$STUB_DEVICE} ${STUB_BUILD_FAIL:+STUB_BUILD_FAIL=1} \
     ${STUB_INSTALL_FAIL:+STUB_INSTALL_FAIL=1} ${STUB_APPS_LOCKED:+STUB_APPS_LOCKED=1} \
     "$REFRESH" "$@" 2>&1)
@@ -607,6 +617,47 @@ has   "signed out of Xcode, alert: says to sign in" "Sign in to Xcode > Settings
 has   "signed out of Xcode, alert: no Retry" "|:600" "$(cat "$ALERTS")"
 has   "signed out of Xcode, alert: profile already expired" "The profile expired Tue 27 Oct 13:00" "$(cat "$ALERTS")"
 eq    "signed out of Xcode, alert: no notification" "" "$(cat "$NOTES")"
+
+# Xcode signed out while nothing is due: warn early, build nothing.
+reset 2026-10-31T19:00:26Z
+STUB_XCODE_ACCOUNTS=none LAUNCHD=1 run 2026-10-26T10:00:00Z
+eq    "signed out, not due: exit 0" 0 "$RC"
+eq    "signed out, not due: no build or install" "" "$(cat "$CALLS")"
+eq    "signed out, not due: one alert" 1 "$(wc -l <"$ALERTS" | tr -d ' ')"
+has   "signed out, not due: alert says to sign in" "|Xcode is signed out.  Sign in under Xcode > Settings > Accounts (needed for the next re-sign)." "$(cat "$ALERTS")"
+has   "signed out, not due: alert has the expiry" "The installed profile expires Sat 31 Oct 19:00" "$(cat "$ALERTS")"
+has   "signed out, not due: no Retry" "|:600" "$(cat "$ALERTS")"
+has   "signed out, not due: logged" "Xcode is signed out (no account in Xcode > Settings > Accounts)" "$(cat "$LOGF")"
+STUB_XCODE_ACCOUNTS=none LAUNCHD=1 run 2026-10-26T10:30:00Z
+eq    "signed out, not due: 10:30 throttled" 1 "$(wc -l <"$ALERTS" | tr -d ' ')"
+eq    "signed out, not due: 10:30 notifies" \
+      "iPhone keyboard re-sign pending: Xcode is signed out. Profile expires Sat 31 Oct 19:00." "$(cat "$NOTES")"
+STUB_XCODE_ACCOUNTS=none LAUNCHD=1 run 2026-10-26T11:00:00Z
+eq    "signed out, not due: 11:00 alerts again" 2 "$(wc -l <"$ALERTS" | tr -d ' ')"
+
+reset 2026-10-30T12:00:00Z
+STUB_XCODE_ACCOUNTS=none LAUNCHD=1 run 2026-10-28T14:00:00Z
+eq    "signed out, due but outside the window: alerts, builds nothing" "0:1:" \
+      "$RC:$(wc -l <"$ALERTS" | tr -d ' '):$(cat "$CALLS")"
+
+reset 2026-10-31T19:00:26Z
+LAUNCHD=1 run 2026-10-26T10:00:00Z
+eq    "signed in, not due: no alert or notification" "" "$(cat "$ALERTS")$(cat "$NOTES")"
+STUB_XCODE_ACCOUNTS=missing LAUNCHD=1 run 2026-10-26T10:00:00Z
+eq    "accounts unreadable: not called signed out" "" "$(cat "$ALERTS")$(cat "$NOTES")"
+lacks "accounts unreadable: nothing logged about it" "signed out" "$(cat "$LOGF")"
+
+reset 2026-10-31T19:00:26Z
+STUB_XCODE_ACCOUNTS=none run 2026-10-26T10:00:00Z --dry-run
+has   "signed out, dry run: says so" "Xcode is signed out" "$OUT"
+eq    "signed out, dry run: no alert or notification" "" "$(cat "$ALERTS")$(cat "$NOTES")"
+
+# Due: the build reports it, with the same advice; one alert, not two.
+reset 2026-10-30T12:00:00Z
+STUB_XCODE_ACCOUNTS=none STUB_BUILD_FAIL=1 LAUNCHD=1 run 2026-10-28T10:00:00Z
+eq    "signed out, due: one alert" 1 "$(wc -l <"$ALERTS" | tr -d ' ')"
+has   "signed out, due: from the build" "|build failed: No Account for Team" "$(cat "$ALERTS")"
+has   "signed out, due: logged up front" "Xcode is signed out; the build will likely fail" "$(cat "$LOGF")"
 
 # Outside launchd (and not a --force run in a terminal): notifications only.
 reset 2026-10-30T12:00:00Z

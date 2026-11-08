@@ -70,7 +70,7 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbi
 # Under test every external tool must resolve to a stub: never the real phone
 # or Apple's servers.
 if [ -n "${VD_REFRESH_TEST_STUBS:-}" ]; then
-  for tool in xcrun xcodebuild xcodegen git security osascript; do
+  for tool in xcrun xcodebuild xcodegen git security osascript defaults; do
     if [ "$(command -v "$tool")" != "$VD_REFRESH_TEST_STUBS/$tool" ]; then
       echo "refusing to run under test: $tool is not stubbed" >&2
       exit 99
@@ -198,6 +198,25 @@ if [ -n "$RECORD_APP" ]; then
   exit 0
 fi
 
+# ---- Xcode account -----------------------------------------------------------
+# A build signs only while Xcode has an Apple account (else "No Accounts").
+# Xcode lists them per environment, e.g. { "IDE.Identifiers.Prod" = ( ); }
+# when signed out. Unreadable (no such key) counts as unknown, not signed out.
+xcode_signed_out() {
+  local lists
+  lists=$(defaults read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists 2>/dev/null) || return 1
+  [ "$(printf '%s' "$lists" | tr -d ' \t\n' | sed 's/[^{};=]*=();//g')" = "{}" ]
+}
+
+# Runs that won't build warn early, so you can sign in before the re-sign is
+# due. Never builds or installs; alerts share the hourly throttle.
+check_xcode_account() {
+  xcode_signed_out || return 0
+  log "Xcode is signed out (no account in Xcode > Settings > Accounts); the next re-sign will fail"
+  [ "$DRY_RUN" = 1 ] ||
+    tell_user "Xcode is signed out" "Sign in under Xcode > Settings > Accounts (needed for the next re-sign)." || true
+}
+
 # ---- decide -----------------------------------------------------------------
 # The state describes one device; for any other its expiry is unknown.
 EXPIRY_ISO="" EXPIRY="" STATUS="no recorded expiry in $STATE_FILE"
@@ -215,9 +234,11 @@ if [ "$FORCE" = 1 ]; then
   log "$STATUS; decision $DECISION, overridden by --force"
 else
   case "$DECISION" in
-    skip) log "skip: $STATUS, refresh starts ${REFRESH_WITHIN_HOURS}h before"; exit 0 ;;
-    wait) log "skip: $STATUS, due but outside the install window $(window_text)"; exit 0 ;;
-    *) log "$STATUS; decision $DECISION" ;;
+    skip) log "skip: $STATUS, refresh starts ${REFRESH_WITHIN_HOURS}h before"; check_xcode_account; exit 0 ;;
+    wait) log "skip: $STATUS, due but outside the install window $(window_text)"; check_xcode_account; exit 0 ;;
+    *) log "$STATUS; decision $DECISION"
+       # The build will fail and say so (with the same advice): one alert.
+       xcode_signed_out && log "Xcode is signed out; the build will likely fail" ;;
   esac
 fi
 
